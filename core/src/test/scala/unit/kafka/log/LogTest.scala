@@ -28,7 +28,7 @@ import org.scalatest.junit.JUnitSuite
 import org.junit.{After, Before, Test}
 import kafka.utils._
 import kafka.server.KafkaConfig
-import kafka.server.epoch.{EpochEntry, LeaderEpochCache, LeaderEpochFileCache}
+import kafka.server.epoch.{EpochEntry, LeaderEpochAppendProposal, LeaderEpochCache, LeaderEpochFileCache}
 import org.apache.kafka.common.record.{RecordBatch, _}
 import org.apache.kafka.common.utils.Utils
 import org.easymock.EasyMock
@@ -1800,8 +1800,10 @@ class LogTest extends JUnitSuite {
 
   private def mockCache(epoch: Int) = {
     val cache = EasyMock.createNiceMock(classOf[LeaderEpochCache])
-    EasyMock.expect(cache.latestUsedEpoch()).andReturn(epoch).anyTimes()
-    EasyMock.replay(cache)
+    val append = EasyMock.createNiceMock(classOf[LeaderEpochAppendProposal])
+    EasyMock.expect(cache.appendProposal()).andReturn(append).anyTimes()
+    EasyMock.expect(append.epochForLeaderMessageAppend()).andReturn(epoch).anyTimes()
+    EasyMock.replay(cache, append)
     cache
   }
 }

@@ -48,7 +48,7 @@ class LeaderEpochFileCacheTest {
     leo = 11
 
     //Then
-    assertEquals(2, cache.latestUsedEpoch())
+    assertEquals(2, cache.latestCommittedEpoch())
     assertEquals(EpochEntry(2, 10), cache.epochEntries()(0))
     assertEquals(11, cache.endOffsetFor(2)) //should match leo
   }
@@ -63,11 +63,11 @@ class LeaderEpochFileCacheTest {
     val cache = new LeaderEpochFileCache(tp, () => leoFinder, checkpoint)
 
     //When
-    cache.cacheLatestEpoch(2)
-    cache.maybeAssignLatestCachedEpochToLeo()
+    cache.appendProposal.proposeLeaderEpochChange(2)
+    cache.appendProposal.maybeFlushUncommittedEpochs()
 
     //Then
-    assertEquals(2, cache.latestUsedEpoch())
+    assertEquals(2, cache.latestCommittedEpoch())
     assertEquals(EpochEntry(2, 9), cache.epochEntries()(0))
   }
 
@@ -113,13 +113,13 @@ class LeaderEpochFileCacheTest {
     leo = 9
     val cache = new LeaderEpochFileCache(tp, () => leoFinder, checkpoint)
 
-    cache.cacheLatestEpoch(2)
-    cache.maybeAssignLatestCachedEpochToLeo()
+    cache.appendProposal.proposeLeaderEpochChange(2)
+    cache.appendProposal.maybeFlushUncommittedEpochs()
 
     //When called again later
     leo = 10
-    cache.cacheLatestEpoch(2)
-    cache.maybeAssignLatestCachedEpochToLeo()
+    cache.appendProposal.proposeLeaderEpochChange(2)
+    cache.appendProposal.maybeFlushUncommittedEpochs()
 
     //Then the offset should NOT have been updated
     assertEquals(9, cache.epochEntries()(0).startOffset)
@@ -134,17 +134,17 @@ class LeaderEpochFileCacheTest {
     leo = 9
     val cache = new LeaderEpochFileCache(tp, () => leoFinder, checkpoint)
 
-    cache.cacheLatestEpoch(2)
-    cache.maybeAssignLatestCachedEpochToLeo()
+    cache.appendProposal.proposeLeaderEpochChange(2)
+    cache.appendProposal.maybeFlushUncommittedEpochs()
 
     //When update epoch with same leo
-    cache.cacheLatestEpoch(3)
-    cache.maybeAssignLatestCachedEpochToLeo()
+    cache.appendProposal.proposeLeaderEpochChange(3)
+    cache.appendProposal.maybeFlushUncommittedEpochs()
 
     //Then the offset should NOT have been updated
     assertEquals(9, cache.endOffsetFor(3))
     assertEquals(9, cache.endOffsetFor(2))
-    assertEquals(3, cache.latestUsedEpoch())
+    assertEquals(3, cache.latestCommittedEpoch())
   }
   
   @Test
@@ -168,7 +168,7 @@ class LeaderEpochFileCacheTest {
     val cache = new LeaderEpochFileCache(tp, () => leoFinder, checkpoint)
 
     //Then
-    assertEquals(UNDEFINED_EPOCH, cache.latestUsedEpoch())
+    assertEquals(UNDEFINED_EPOCH, cache.latestCommittedEpoch())
     assertEquals(UNDEFINED_EPOCH_OFFSET, cache.endOffsetFor(0))
   }
 
@@ -253,8 +253,8 @@ class LeaderEpochFileCacheTest {
     val cache = new LeaderEpochFileCache(tp, () => leoFinder, checkpoint)
 
     //When
-    cache.cacheLatestEpoch(epoch = 2)
-    cache.maybeAssignLatestCachedEpochToLeo()
+    cache.appendProposal.proposeLeaderEpochChange(epoch = 2)
+    cache.appendProposal.epochForLeaderMessageAppend()
 
     //Then
     assertEquals(UNDEFINED_EPOCH_OFFSET, cache.endOffsetFor(3))
@@ -312,7 +312,7 @@ class LeaderEpochFileCacheTest {
     cache.assign(epoch = 1, offset = 7); leo = 8
 
     //Then epoch should not be changed
-    assertEquals(2, cache.latestUsedEpoch())
+    assertEquals(2, cache.latestCommittedEpoch())
 
     //Then end offset for epoch 1 shouldn't have changed
     assertEquals(6, cache.endOffsetFor(1))
@@ -347,15 +347,15 @@ class LeaderEpochFileCacheTest {
 
     //Given
     val cache = new LeaderEpochFileCache(tp, () => leoFinder, checkpoint)
-    cache.cacheLatestEpoch(epoch = 0) //leo=0
-    cache.maybeAssignLatestCachedEpochToLeo()
+    cache.appendProposal.proposeLeaderEpochChange(epoch = 0) //leo=0
+    cache.appendProposal.maybeFlushUncommittedEpochs()
 
     //When
-    cache.cacheLatestEpoch(epoch = 1) //leo=0
-    cache.maybeAssignLatestCachedEpochToLeo()
+    cache.appendProposal.proposeLeaderEpochChange(epoch = 1) //leo=0
+    cache.appendProposal.maybeFlushUncommittedEpochs()
 
     //Then epoch should go up
-    assertEquals(1, cache.latestUsedEpoch())
+    assertEquals(1, cache.latestCommittedEpoch())
     //offset for 1 should still be 0
     assertEquals(0, cache.endOffsetFor(1))
     //offset for 0 should the start offset of epoch(1) => 0
@@ -370,8 +370,8 @@ class LeaderEpochFileCacheTest {
     assertEquals(0, cache.endOffsetFor(0))
 
     //When
-    cache.cacheLatestEpoch(epoch = 2) //leo=5
-    cache.maybeAssignLatestCachedEpochToLeo()
+    cache.appendProposal.proposeLeaderEpochChange(epoch = 2) //leo=5
+    cache.appendProposal.maybeFlushUncommittedEpochs()
     leo = 10 //write another 5 messages
 
     //Then end offset for epoch(2) should be leo => 10
@@ -398,7 +398,7 @@ class LeaderEpochFileCacheTest {
     cache.assign(epoch = 0, offset = 2); leo = 3
 
     //Then epoch should stay, offsets should grow
-    assertEquals(0, cache.latestUsedEpoch())
+    assertEquals(0, cache.latestCommittedEpoch())
     assertEquals(leo, cache.endOffsetFor(0))
 
     //When messages arrive with greater epoch
@@ -406,7 +406,7 @@ class LeaderEpochFileCacheTest {
     cache.assign(epoch = 1, offset = 4); leo = 5
     cache.assign(epoch = 1, offset = 5); leo = 6
 
-    assertEquals(1, cache.latestUsedEpoch())
+    assertEquals(1, cache.latestCommittedEpoch())
     assertEquals(leo, cache.endOffsetFor(1))
 
     //When
@@ -414,7 +414,7 @@ class LeaderEpochFileCacheTest {
     cache.assign(epoch = 2, offset = 7); leo = 8
     cache.assign(epoch = 2, offset = 8); leo = 9
 
-    assertEquals(2, cache.latestUsedEpoch())
+    assertEquals(2, cache.latestCommittedEpoch())
     assertEquals(leo, cache.endOffsetFor(2))
 
     //Older epochs should return the start offset of the first message in the subsequent epoch.
@@ -589,7 +589,7 @@ class LeaderEpochFileCacheTest {
     cache.clearLatest(offset = 9)
 
     //Then should keep the preceding epochs
-    assertEquals(3, cache.latestUsedEpoch())
+    assertEquals(3, cache.latestCommittedEpoch())
     assertEquals(ListBuffer(EpochEntry(2, 6), EpochEntry(3, 8)), cache.epochEntries)
   }
 
@@ -653,7 +653,7 @@ class LeaderEpochFileCacheTest {
     val cache = new LeaderEpochFileCache(tp, () => leoFinder, checkpoint)
 
     //Then
-    assertEquals(-1, cache.latestUsedEpoch)
+    assertEquals(-1, cache.latestCommittedEpoch)
   }
 
   @Test
@@ -699,16 +699,16 @@ class LeaderEpochFileCacheTest {
     val cache = new LeaderEpochFileCache(tp, () => leoFinder, checkpoint)
 
     //When
-    cache.cacheLatestEpoch(2)
+    cache.appendProposal.proposeLeaderEpochChange(2)
 
     //Then
-    assertEquals(UNDEFINED_EPOCH, cache.latestUsedEpoch())
+    assertEquals(UNDEFINED_EPOCH, cache.latestCommittedEpoch())
 
     //When
-    cache.maybeAssignLatestCachedEpochToLeo()
+    cache.appendProposal.maybeFlushUncommittedEpochs()
 
     //Then should have saved epoch
-    assertEquals(2, cache.latestUsedEpoch())
+    assertEquals(2, cache.latestCommittedEpoch())
 
     //Then should have applied LEO to epoch
     assertEquals(5, cache.endOffsetFor(2))

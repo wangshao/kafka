@@ -20,24 +20,47 @@ import java.util.concurrent.locks.ReentrantReadWriteLock
 
 import kafka.server.LogOffsetMetadata
 import kafka.server.checkpoints.LeaderEpochCheckpoint
+import kafka.server.epoch.State._
 import org.apache.kafka.common.requests.EpochEndOffset.{UNDEFINED_EPOCH, UNDEFINED_EPOCH_OFFSET}
 import kafka.utils.CoreUtils._
 import kafka.utils.Logging
 import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.requests.EpochEndOffset
 
 import scala.collection.mutable.ListBuffer
 
+
+trait LeaderEpochAppendProposal {
+  def proposeLeaderEpochChange(epoch: Int)
+  def epochForLeaderMessageAppend(): Int
+  def maybeFlushUncommittedEpochs()
+}
+
 trait LeaderEpochCache {
-  def cacheLatestEpoch(leaderEpoch: Int)
-  def maybeAssignLatestCachedEpochToLeo()
   def assign(leaderEpoch: Int, offset: Long)
-  def latestUsedEpoch(): Int
+  def latestCommittedEpoch(): Int
   def endOffsetFor(epoch: Int): Long
   def clearLatest(offset: Long)
   def clearEarliest(offset: Long)
   def clear()
+  def appendProposal(): LeaderEpochAppendProposal
 }
+
+object State {
+  sealed trait AppendState { def state: Byte }
+
+  case object NotSet extends AppendState { val state: Byte = 0 }
+  case object LeaderEpochProposed extends AppendState { val state: Byte = 1 }
+  case object LeaderEpochCommitted extends AppendState {val state: Byte = 2 }
+
+  val allowedTransitions: Map[AppendState, Seq[AppendState]] = Map (
+    NotSet -> Seq(LeaderEpochProposed),
+    LeaderEpochProposed -> Seq(LeaderEpochProposed, LeaderEpochCommitted),
+    LeaderEpochCommitted -> Seq(LeaderEpochProposed)
+  )
+}
+
+// Mapping of epoch to the first offset of the subsequent epoch
+case class EpochEntry(epoch: Int, startOffset: Long)
 
 /**
   * Represents a cache of (LeaderEpoch => Offset) mappings for a particular replica.
@@ -51,7 +74,7 @@ trait LeaderEpochCache {
 class LeaderEpochFileCache(topicPartition: TopicPartition, leo: () => LogOffsetMetadata, checkpoint: LeaderEpochCheckpoint) extends LeaderEpochCache with Logging {
   private val lock = new ReentrantReadWriteLock()
   private var epochs: ListBuffer[EpochEntry] = lock synchronized { ListBuffer(checkpoint.read(): _*) }
-  private var cachedLatestEpoch: Option[Int] = None //epoch which has yet to be assigned to a message.
+  private val leaderAppendWorkflow = new AppendProposal()
 
   /**
     * Assigns the supplied Leader Epoch to the supplied Offset
@@ -62,7 +85,7 @@ class LeaderEpochFileCache(topicPartition: TopicPartition, leo: () => LogOffsetM
     */
   override def assign(epoch: Int, offset: Long): Unit = {
     inWriteLock(lock) {
-      if (epoch >= 0 && epoch > latestUsedEpoch && offset >= latestOffset) {
+      if (epoch >= 0 && epoch > latestCommittedEpoch && offset >= latestOffset) {
         info(s"Updated PartitionLeaderEpoch. ${epochChangeMsg(epoch, offset)}. Cache now contains ${epochs.size} entries.")
         epochs += EpochEntry(epoch, offset)
         flush()
@@ -74,11 +97,12 @@ class LeaderEpochFileCache(topicPartition: TopicPartition, leo: () => LogOffsetM
 
   /**
     * Returns the current Leader Epoch. This is the latest epoch
-    * which has messages assigned to it.
+    * which has messages assigned to it (cached epochs, which have
+    * yet to be assigned to messages, will be ignored)
     *
     * @return
     */
-  override def latestUsedEpoch(): Int = {
+  override def latestCommittedEpoch(): Int = {
     inReadLock(lock) {
       if (epochs.isEmpty) UNDEFINED_EPOCH else epochs.last.epoch
     }
@@ -96,7 +120,7 @@ class LeaderEpochFileCache(topicPartition: TopicPartition, leo: () => LogOffsetM
   override def endOffsetFor(requestedEpoch: Int): Long = {
     inReadLock(lock) {
       val offset =
-        if (requestedEpoch == latestUsedEpoch) {
+        if (requestedEpoch == latestCommittedEpoch) {
           leo().messageOffset
         }
         else {
@@ -178,10 +202,10 @@ class LeaderEpochFileCache(topicPartition: TopicPartition, leo: () => LogOffsetM
     checkpoint.write(epochs)
   }
 
-  def epochChangeMsg(epoch: Int, offset: Long) = s"New: {epoch:$epoch, offset:$offset}, Latest: {epoch:$latestUsedEpoch, offset$latestOffset} for Partition: $topicPartition"
+  def epochChangeMsg(epoch: Int, offset: Long) = s"New: {epoch:$epoch, offset:$offset}, Latest: {epoch:$latestCommittedEpoch, offset$latestOffset} for Partition: $topicPartition"
 
   def maybeWarn(epoch: Int, offset: Long) = {
-    if (epoch < latestUsedEpoch())
+    if (epoch < latestCommittedEpoch())
       warn(s"Received a PartitionLeaderEpoch assignment for an epoch < latestEpoch. " +
         s"This implies messages have arrived out of order. ${epochChangeMsg(epoch, offset)}")
     else if (epoch < 0)
@@ -191,34 +215,72 @@ class LeaderEpochFileCache(topicPartition: TopicPartition, leo: () => LogOffsetM
         s"This implies messages have arrived out of order. ${epochChangeMsg(epoch, offset)}")
   }
 
-  /**
-    * Registers a PartitionLeaderEpoch (typically in response to a leadership change).
-    * This will be cached until {@link #maybeAssignLatestCachedEpochToLeo} is called.
-    *
-    * This allows us to register an epoch in response to a leadership change, but not persist
-    * that epoch until a message arrives and is stamped. This asigns the aassignment of leadership
-    * on leader and follower, for eases debugability.
-    *
-    * @param epoch
-    */
-  override def cacheLatestEpoch(epoch: Int) = {
-    inWriteLock(lock) {
-      cachedLatestEpoch = Some(epoch)
-    }
+  override def appendProposal() : LeaderEpochAppendProposal = {
+    this.leaderAppendWorkflow
   }
 
   /**
-    * If there is a cached epoch, associate its start offset with the current log end offset if it's not in the epoch list yet.
+    * Appending Epochs is a multi-stage process as we cache the leader epoch when
+    * a Leader Change occurs, but only persist it to the Epoch Cache when after it
+    * has been appended to a message.
+    *
+    * Hence the workflow is as follows:
+    *
+    * When we get a Leader Change:
+    *   -> proposeLeaderEpochChange: Propose a change in epoch to be applied to subsequent messages by the leader
+    *
+    * When message arrives:
+    *   -> epochForLeaderMessageAppend: Get the cached epoch, or latest epoch if nothing is cached
+    *
+    * When the proposed epoch is successfully stamped onto a message:
+    *   -> epochForLeaderMessageAppend: Get the cached epoch, or latest epoch if nothing is cached
     */
-  override def maybeAssignLatestCachedEpochToLeo() = {
-    inWriteLock(lock) {
-      if (cachedLatestEpoch == None) error("Attempt to assign log end offset to epoch before epoch has been set. This should never happen.")
-      cachedLatestEpoch.foreach { epoch =>
-        assign(epoch, leo().messageOffset)
+  class AppendProposal extends LeaderEpochAppendProposal {
+
+    private var proposedEpoch: Option[Int] = None //epoch which has yet to be assigned to a message.
+    private var state: AppendState = NotSet
+
+    /**
+      * Registers a PartitionLeaderEpoch (typically in response to a leadership change). This
+      * will be added to the LeaderEpochCache later, when it is stamped onto a message.
+      *
+      * @param epoch
+      */
+    override def proposeLeaderEpochChange(epoch: Int) = {
+      inWriteLock(lock) {
+        transition(LeaderEpochProposed)
+        proposedEpoch = Some(epoch)
       }
+    }
+
+    /**
+      * Get the proposed epoch if one exists, else the committed epoch
+      */
+    override def epochForLeaderMessageAppend(): Int = {
+      inReadLock(lock) {
+        proposedEpoch match {
+          case Some(epoch) => epoch
+          case None => latestCommittedEpoch
+        }
+      }
+    }
+
+    /**
+      * If there is a proposed epoch, commit it to the Epoch File Cache
+      */
+    override def maybeFlushUncommittedEpochs(): Unit = {
+      inWriteLock(lock) {
+        proposedEpoch.map { epoch =>
+          transition(LeaderEpochCommitted)
+          assign(epoch, leo().messageOffset)
+          proposedEpoch = None
+        }
+      }
+    }
+
+    private def transition(newState: AppendState): Unit = {
+      assert (allowedTransitions(state).contains(newState), s"Failed LeaderEpochAppend State Transition: $state -> $newState")
+      state = newState
     }
   }
 }
-
-// Mapping of epoch to the first offset of the subsequent epoch
-case class EpochEntry(epoch: Int, startOffset: Long)
