@@ -233,7 +233,7 @@ class LeaderEpochFileCache(topicPartition: TopicPartition, leo: () => LogOffsetM
     *   -> epochForLeaderMessageAppend: Get the cached epoch, or latest epoch if nothing is cached
     *
     * When the proposed epoch is successfully stamped onto a message:
-    *   -> epochForLeaderMessageAppend: Get the cached epoch, or latest epoch if nothing is cached
+    *   -> maybeFlushUncommittedEpochs: If there is a proposed epoch, commit it to the Epoch File Cache
     */
   class AppendProposal extends LeaderEpochAppendProposal {
 
